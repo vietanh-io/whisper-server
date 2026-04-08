@@ -1,12 +1,15 @@
 # whisper-server (Local FastAPI + Silero VAD)
 
-Local-first transcription server using FastAPI and `faster-whisper`.
+Local-first transcription server using FastAPI with two selectable backends:
+- `faster-whisper` (supports Silero VAD)
+- `openai-whisper` (`whisper` package)
 
 ## Features
 
 - `POST /transcribe`: accepts file upload or `media_url`
 - `GET /health`: service health check
-- Built-in Silero VAD via `faster-whisper` (`vad_filter=True`)
+- Select backend per request (`backend=faster-whisper|whisper`)
+- Built-in Silero VAD for `faster-whisper` backend (`vad_filter=True`)
 - Output persistence per job (`txt`, `srt`, optional `json`)
 - Download output files via `GET /outputs/{job_id}/{filename}`
 
@@ -23,6 +26,8 @@ python -m venv .venv
 pip install -r requirements.txt
 copy .env.example .env
 ```
+
+Most defaults are configured via `.env` (backend, model, task, output formats, VAD defaults).
 
 ## Run server
 
@@ -50,11 +55,19 @@ python scripts\client.py --media-url "https://example.com/media.mp4"
 python scripts\client.py --file "C:\path\to\audio.wav" --vad-threshold 0.45 --min-silence-duration-ms 700 --speech-pad-ms 450
 ```
 
+### 4) Choose backend per request
+
+```powershell
+python scripts\client.py --file "C:\path\to\audio.wav" --backend whisper
+python scripts\client.py --file "C:\path\to\audio.wav" --backend faster-whisper
+```
+
 ## Direct curl-like request (multipart)
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/transcribe" \
   -F "file=@sample.wav" \
+  -F "backend=faster-whisper" \
   -F "task=transcribe" \
   -F "output_formats=txt,srt,json" \
   -F "vad_filter=true" \
@@ -65,6 +78,7 @@ curl -X POST "http://127.0.0.1:8000/transcribe" \
 
 ## Notes
 
-- On CPU, use `WHISPER_MODEL=small` or `medium` for reasonable speed.
-- For GPU (later), set `WHISPER_DEVICE=cuda` and a suitable compute type.
-- If FFmpeg is missing, service startup will fail with a clear error.
+- For `faster-whisper`, tune `FASTER_WHISPER_*` vars in `.env`.
+- For `whisper`, tune `WHISPER_*` vars in `.env`.
+- On CPU, use `small` or `tiny` models for faster iteration.
+- If FFmpeg is missing, `/transcribe` returns a clear `503`.

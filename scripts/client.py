@@ -30,15 +30,19 @@ def check_health(base_url: str, timeout: int) -> None:
 def send_file(base_url: str, file_path: Path, args: argparse.Namespace) -> dict:
     with file_path.open("rb") as handle:
         files = {"file": (file_path.name, handle)}
-        data = {
-            "language": args.language,
-            "task": args.task,
-            "output_formats": args.output_formats,
-            "vad_filter": str(args.vad_filter).lower(),
-            "vad_threshold": str(args.vad_threshold),
-            "min_silence_duration_ms": str(args.min_silence_duration_ms),
-            "speech_pad_ms": str(args.speech_pad_ms),
-        }
+        data: dict[str, str] = {}
+        if args.language is not None:
+            data["language"] = args.language
+        if args.task is not None:
+            data["task"] = args.task
+        if args.backend is not None:
+            data["backend"] = args.backend
+        if args.output_formats is not None:
+            data["output_formats"] = args.output_formats
+        data["vad_filter"] = str(args.vad_filter).lower()
+        data["vad_threshold"] = str(args.vad_threshold)
+        data["min_silence_duration_ms"] = str(args.min_silence_duration_ms)
+        data["speech_pad_ms"] = str(args.speech_pad_ms)
         response = requests.post(
             f"{base_url}/transcribe",
             files=files,
@@ -51,16 +55,19 @@ def send_file(base_url: str, file_path: Path, args: argparse.Namespace) -> dict:
 
 
 def send_url(base_url: str, media_url: str, args: argparse.Namespace) -> dict:
-    data = {
-        "media_url": media_url,
-        "language": args.language,
-        "task": args.task,
-        "output_formats": args.output_formats,
-        "vad_filter": str(args.vad_filter).lower(),
-        "vad_threshold": str(args.vad_threshold),
-        "min_silence_duration_ms": str(args.min_silence_duration_ms),
-        "speech_pad_ms": str(args.speech_pad_ms),
-    }
+    data: dict[str, str] = {"media_url": media_url}
+    if args.language is not None:
+        data["language"] = args.language
+    if args.task is not None:
+        data["task"] = args.task
+    if args.backend is not None:
+        data["backend"] = args.backend
+    if args.output_formats is not None:
+        data["output_formats"] = args.output_formats
+    data["vad_filter"] = str(args.vad_filter).lower()
+    data["vad_threshold"] = str(args.vad_threshold)
+    data["min_silence_duration_ms"] = str(args.min_silence_duration_ms)
+    data["speech_pad_ms"] = str(args.speech_pad_ms)
     response = requests.post(f"{base_url}/transcribe", data=data, timeout=args.timeout)
     if response.status_code >= 400:
         _raise_with_server_detail(response)
@@ -73,8 +80,9 @@ def main() -> None:
     parser.add_argument("--file", type=Path)
     parser.add_argument("--media-url")
     parser.add_argument("--language", default=None)
-    parser.add_argument("--task", default="transcribe", choices=["transcribe", "translate"])
-    parser.add_argument("--output-formats", default="txt,srt")
+    parser.add_argument("--task", choices=["transcribe", "translate"])
+    parser.add_argument("--backend", choices=["faster-whisper", "whisper"])
+    parser.add_argument("--output-formats")
     parser.add_argument("--vad-filter", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--vad-threshold", type=float, default=0.5)
     parser.add_argument("--min-silence-duration-ms", type=int, default=500)
@@ -96,6 +104,7 @@ def main() -> None:
         payload = send_url(args.base_url, args.media_url, args)
 
     print(f"job_id: {payload['job_id']}")
+    print(f"backend: {payload.get('backend')}")
     print(f"language: {payload.get('language')}")
     print(f"duration: {payload.get('duration')}")
     print("output_files:")

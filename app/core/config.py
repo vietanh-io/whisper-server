@@ -14,12 +14,19 @@ class Settings(BaseSettings):
     output_dir: Path = Path("outputs")
     temp_dir: Path = Path(".tmp")
 
-    whisper_model: str = "tiny"
-    whisper_device: str = "cpu"
-    whisper_compute_type: str = "int8"
+    default_backend: str = "faster-whisper"
+    default_output_formats: str = "txt,srt"
 
     default_language: str | None = None
     default_task: str = "transcribe"
+
+    faster_whisper_model: str = "small"
+    faster_whisper_device: str = "cpu"
+    faster_whisper_compute_type: str = "int8"
+
+    whisper_model: str = "small"
+    whisper_device: str = "cpu"
+    whisper_fp16: bool = False
 
     default_vad_filter: bool = True
     default_vad_threshold: float = 0.5
