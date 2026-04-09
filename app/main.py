@@ -14,6 +14,8 @@ media_service = MediaService(output_dir=settings.output_dir, temp_dir=settings.t
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     media_service.ensure_runtime_dirs()
+    settings.models_dir.mkdir(parents=True, exist_ok=True)
+    settings.faster_whisper_download_root.mkdir(parents=True, exist_ok=True)
     app.state.ffmpeg_ok = media_service.ffmpeg_available()
     app.state.media_service = media_service
     app.state.whisper_service = whisper_service

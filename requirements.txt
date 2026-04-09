@@ -2,6 +2,6 @@ fastapi
 uvicorn[standard]
 python-multipart
 faster-whisper
-openai-whisper
 pydantic-settings
 requests
+yt-dlp
