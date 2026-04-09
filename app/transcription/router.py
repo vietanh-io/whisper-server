@@ -1,3 +1,28 @@
+"""
+HTTP endpoints for the transcription API.
+
+Endpoint summary
+----------------
+GET  /health                  Server health + ffmpeg status
+GET  /models                  List available / downloaded whisper models
+POST /models/download         Download a model by name
+POST /transcribe              Transcribe a single file or URL (form-data)
+POST /transcribe/uploads      Transcribe multiple file uploads (form-data)
+POST /transcribe/links        Transcribe a list of remote URLs (JSON body)
+GET  /outputs/{job_id}/{fn}   Download a transcript output file
+
+Data flow
+---------
+1. Form fields are collected into ``TranscribeFormInput`` via
+   ``_build_request_from_form`` and converted to a canonical
+   ``TranscribeRequest``.
+2. The request is routed to either ``_transcribe_single_upload`` (file)
+   or ``_transcribe_single_remote_link`` (URL).
+3. Both paths normalise input to a 16 kHz WAV via ``MediaService``, then
+   delegate to ``_transcribe_prepared_wav`` which decides whether to
+   chunk (long-media batching) or transcribe directly.
+"""
+
 import logging
 from typing import Annotated
 from pathlib import Path
@@ -27,6 +52,8 @@ from app.transcription.service import WhisperService
 router = APIRouter(tags=["transcription"])
 logger = logging.getLogger(__name__)
 
+
+# ── Health & model management ───────────────────────────────────────────
 
 @router.get("/health", response_model=HealthResponse)
 def health(
@@ -66,6 +93,8 @@ def download_model(
         raise HTTPException(status_code=400, detail=f"Model download failed: {exc}") from exc
 
 
+# ── Form-data → TranscribeRequest adapter ───────────────────────────────
+
 def _build_request_from_form(
     *,
     source_language: str | None,
@@ -104,6 +133,11 @@ def _build_request_from_form(
     max_initial_timestamp: float,
     max_new_tokens: int | None,
 ) -> TranscribeRequest:
+    """Construct a validated TranscribeRequest from raw form field values.
+
+    Uses TranscribeFormInput as an intermediate to handle string parsing
+    (comma-separated formats/temperatures) and Pydantic validation.
+    """
     return TranscribeFormInput(
         media_url=None,
         source_language=source_language,
@@ -144,7 +178,10 @@ def _build_request_from_form(
     ).to_request()
 
 
+# ── Batching decision helpers ───────────────────────────────────────────
+
 def _request_wants_batch(request_data: TranscribeRequest) -> bool:
+    """Check if the request explicitly or implicitly wants batching."""
     if request_data.batch_mode == "on":
         return True
     if request_data.batch_mode == "off":
@@ -155,10 +192,13 @@ def _request_wants_batch(request_data: TranscribeRequest) -> bool:
 
 
 def _should_batch(duration_seconds: float, request_data: TranscribeRequest) -> bool:
+    """Decide whether to chunk-and-batch based on duration and request flags."""
     if request_data.batch_mode == "on":
         return True
     return _request_wants_batch(request_data) and duration_seconds >= settings.batch_threshold_seconds
 
+
+# ── Core transcription pipeline ─────────────────────────────────────────
 
 def _transcribe_prepared_wav(
     *,
@@ -168,6 +208,12 @@ def _transcribe_prepared_wav(
     workspace_input_wav: Path,
     workspace_job_dir: Path,
 ) -> TranscribeResponse:
+    """Transcribe a normalised WAV file, optionally chunking for long media.
+
+    If the audio duration exceeds the batch threshold (and batching is
+    enabled), the file is split into fixed-length chunks which are each
+    transcribed separately, then merged into a single result.
+    """
     duration_seconds = media_service.probe_duration_seconds(workspace_input_wav)
     if _should_batch(duration_seconds, request_data):
         chunk_dir = workspace_job_dir / "chunks"
@@ -214,6 +260,7 @@ def _transcribe_prepared_wav(
             chunk_count=merged.chunk_count,
         )
 
+    # Short media: transcribe the whole file in one pass
     single = whisper_service.transcribe(
         input_path=workspace_input_wav,
         request_data=request_data,
@@ -238,6 +285,8 @@ def _transcribe_prepared_wav(
     )
 
 
+# ── Single-item transcription helpers ───────────────────────────────────
+
 def _transcribe_single_upload(
     *,
     file: UploadFile,
@@ -245,6 +294,10 @@ def _transcribe_single_upload(
     media_service: MediaService,
     whisper_service: WhisperService,
 ) -> TranscribeResponse:
+    """Save an uploaded file, transcode to WAV, and transcribe it.
+
+    The temporary input directory is always cleaned up, even on error.
+    """
     workspace = media_service.create_workspace(file.filename)
     uploaded_path = workspace.input_dir / (file.filename or "upload.bin")
     wav_path = workspace.input_dir / "normalized.wav"
@@ -272,6 +325,11 @@ def _transcribe_single_remote_link(
     media_service: MediaService,
     whisper_service: WhisperService,
 ) -> TranscribeResponse:
+    """Resolve a remote URL, transcode to WAV via ffmpeg, and transcribe.
+
+    YouTube URLs are first resolved to a direct stream via yt-dlp.
+    The temporary input directory is always cleaned up, even on error.
+    """
     workspace = media_service.create_workspace("remote_link.wav")
     wav_path = workspace.input_dir / "normalized.wav"
     try:
@@ -290,6 +348,8 @@ def _transcribe_single_remote_link(
     finally:
         media_service.cleanup_workspace_input(workspace)
 
+
+# ── HTTP endpoints ──────────────────────────────────────────────────────
 
 @router.post("/transcribe", response_model=TranscribeResponse)
 async def transcribe_single(
@@ -334,6 +394,7 @@ async def transcribe_single(
     max_initial_timestamp: float = Form(default=settings.default_max_initial_timestamp),
     max_new_tokens: int | None = Form(default=settings.default_max_new_tokens),
 ) -> TranscribeResponse:
+    """Transcribe a single file upload or a single remote URL."""
     if file is None and not media_url:
         raise HTTPException(status_code=400, detail="Provide either file or media_url.")
 
@@ -438,6 +499,7 @@ async def transcribe_uploads(
     max_initial_timestamp: float = Form(default=settings.default_max_initial_timestamp),
     max_new_tokens: int | None = Form(default=settings.default_max_new_tokens),
 ) -> BatchTranscribeResponse:
+    """Transcribe multiple uploaded files. Each file is processed sequentially."""
     if not files:
         raise HTTPException(status_code=400, detail="Provide at least one file in multipart/form-data.")
     request_data = _build_request_from_form(
@@ -497,6 +559,7 @@ async def transcribe_links(
     media_service: Annotated[MediaService, Depends(get_media_service)],
     whisper_service: Annotated[WhisperService, Depends(get_whisper_service)],
 ) -> BatchTranscribeResponse:
+    """Transcribe a list of remote media URLs (JSON body)."""
     request_data = TranscribeRequest(
         source_language=payload.source_language,
         task=payload.task,
@@ -550,15 +613,17 @@ async def transcribe_links(
     return BatchTranscribeResponse(items=items)
 
 
+# ── Output file download ───────────────────────────────────────────────
+
 @router.get("/outputs/{job_id}/{filename}")
 def get_output(
     job_id: str,
     filename: str,
     media_service: Annotated[MediaService, Depends(get_media_service)],
 ) -> FileResponse:
+    """Serve a transcript output file (txt, srt, or json) for download."""
     try:
         candidate = media_service.resolve_output_file(job_id, filename)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return FileResponse(path=str(candidate), filename=filename)
-

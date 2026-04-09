@@ -1,3 +1,19 @@
+"""
+Whisper transcription service -- the core inference layer.
+
+Responsibilities
+----------------
+* Load / cache faster-whisper ``WhisperModel`` instances (keyed by
+  model name + device + compute_type so the same combo is never loaded
+  twice).
+* Run transcription via either **sequential** (``model.transcribe``) or
+  **batched** (``BatchedInferencePipeline.transcribe``) mode, forwarding
+  all decoding, quality-threshold, prompting, and VAD parameters from
+  the request.
+* Write transcript output files (txt, srt, json) into the job directory.
+* Merge chunked results when long-media batching is used.
+"""
+
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +28,8 @@ from app.transcription.schemas import SegmentOut, TranscribeRequest
 
 @dataclass
 class TranscriptArtifacts:
+    """Container for everything produced by a single transcription run."""
+
     model_name: str
     device: str
     compute_type: str
@@ -25,8 +43,13 @@ class TranscriptArtifacts:
 
 
 class WhisperService:
+    """Manages faster-whisper model instances and runs inference."""
+
     def __init__(self) -> None:
+        # Cache: (model_name, device, compute_type) -> loaded WhisperModel
         self._models: dict[tuple[str, str, str], WhisperModel] = {}
+
+    # ── Public API ──────────────────────────────────────────────────────
 
     def transcribe(
         self,
@@ -37,9 +60,17 @@ class WhisperService:
         chunk_index: int = 0,
         chunk_offset_seconds: float = 0.0,
     ) -> TranscriptArtifacts:
+        """Transcribe a single WAV file and write outputs to *job_dir*.
+
+        When processing chunked audio, *chunk_index* > 0 indicates which
+        chunk this is, and *chunk_offset_seconds* shifts all segment
+        timestamps so they reflect their position in the original media.
+        """
         source_language = request_data.source_language or settings.default_source_language
         if isinstance(source_language, str):
             source_language = source_language.strip().lower() or None
+
+        # Guard: reject English->English translation early when configured
         if (
             request_data.task == "translate"
             and source_language == "en"
@@ -58,6 +89,8 @@ class WhisperService:
             request_data=request_data,
             source_language=source_language,
         )
+
+        # Post-detection guard: if whisper auto-detected English, reject
         if (
             request_data.task == "translate"
             and detected_language == "en"
@@ -65,6 +98,7 @@ class WhisperService:
         ):
             raise ValueError("Detected source language is English. Only non-English to English is supported.")
 
+        # Shift timestamps when this is a chunk within a larger media file
         if chunk_offset_seconds > 0:
             shifted: list[SegmentOut] = []
             for seg in segments_list:
@@ -95,9 +129,11 @@ class WhisperService:
         )
 
     def get_available_models(self) -> list[str]:
+        """Return all model names known to faster-whisper."""
         return sorted(available_models())
 
     def get_downloaded_models(self) -> list[str]:
+        """Return model directory names already present in the download root."""
         root = settings.faster_whisper_download_root
         if not root.exists():
             return []
@@ -109,6 +145,7 @@ class WhisperService:
         device: str | None = None,
         compute_type: str | None = None,
     ) -> dict[str, str]:
+        """Download (or ensure cached) a model and return metadata."""
         resolved_device = device or settings.faster_whisper_device
         resolved_compute_type = compute_type or settings.faster_whisper_compute_type
         self._get_model(
@@ -123,7 +160,58 @@ class WhisperService:
             "download_root": str(settings.faster_whisper_download_root),
         }
 
+    def merge_chunk_outputs(
+        self,
+        *,
+        job_dir: Path,
+        chunk_results: list[TranscriptArtifacts],
+        formats: list[str],
+        task: str,
+    ) -> TranscriptArtifacts:
+        """Merge multiple chunk transcription results into a single output.
+
+        Called after long-media chunking to produce a unified transcript
+        file set that covers the entire original media.
+        """
+        if not chunk_results:
+            raise ValueError("No chunk results to merge.")
+
+        all_segments: list[SegmentOut] = []
+        full_text_parts: list[str] = []
+        total_duration = 0.0
+        for chunk in chunk_results:
+            all_segments.extend(chunk.segments)
+            if chunk.text:
+                full_text_parts.append(chunk.text)
+            total_duration = max(total_duration, chunk.duration)
+
+        merged_text = "\n".join(full_text_parts).strip()
+        merged = write_outputs(
+            model_name=chunk_results[0].model_name,
+            device=chunk_results[0].device,
+            compute_type=chunk_results[0].compute_type,
+            job_dir=job_dir,
+            text=merged_text,
+            language=chunk_results[0].language,
+            duration=total_duration,
+            segments=all_segments,
+            formats=formats,
+            task=task,
+            vad={},
+            chunk_index=0,
+            used_batching=True,
+            chunk_count=len(chunk_results),
+        )
+        return merged
+
+    # ── Private helpers ─────────────────────────────────────────────────
+
     def _get_model(self, *, model_name: str, device: str, compute_type: str) -> WhisperModel:
+        """Return a cached model or load a new one.
+
+        Models are keyed by (name, device, compute_type) so requesting
+        the same combination twice returns the existing instance.
+        """
         key = (model_name, device, compute_type)
         if key not in self._models:
             self._models[key] = WhisperModel(
@@ -145,6 +233,10 @@ class WhisperService:
         request_data: TranscribeRequest,
         source_language: str | None,
     ) -> tuple[str, str | None, float, list[SegmentOut], bool]:
+        """Run faster-whisper transcription (batched or sequential).
+
+        Returns (text, detected_language, duration, segments, used_batching).
+        """
         use_batch = self._resolve_batch_enabled(request_data)
         use_vad = self._resolve_vad_enabled(request_data)
         vad_parameters = {
@@ -152,12 +244,14 @@ class WhisperService:
             "min_silence_duration_ms": request_data.vad.min_silence_duration_ms,
             "speech_pad_ms": request_data.vad.speech_pad_ms,
         }
+
         # faster-whisper accepts float (greedy) or list[float] (fallback sequence)
         temperature: float | list[float] = request_data.temperature
         if len(request_data.temperature) == 1:
             temperature = request_data.temperature[0]
 
-        # Params shared by both WhisperModel.transcribe() and BatchedInferencePipeline.transcribe()
+        # Parameters accepted by both WhisperModel.transcribe() and
+        # BatchedInferencePipeline.transcribe()
         common_params: dict[str, Any] = {
             "language": source_language,
             "task": request_data.task,
@@ -191,8 +285,9 @@ class WhisperService:
             )
             used_batching = True
         else:
-            # Sequential-only params: prefix, max_initial_timestamp,
-            # hallucination_silence_threshold, max_new_tokens
+            # These params are only supported by sequential WhisperModel.transcribe(),
+            # not by BatchedInferencePipeline:
+            #   prefix, max_initial_timestamp, hallucination_silence_threshold, max_new_tokens
             segments_iter, info = model.transcribe(
                 str(input_path),
                 prefix=request_data.prefix,
@@ -203,6 +298,7 @@ class WhisperService:
             )
             used_batching = False
 
+        # Consume the segment generator and collect results
         segments_list: list[SegmentOut] = []
         text_parts: list[str] = []
         duration = 0.0
@@ -221,6 +317,10 @@ class WhisperService:
         return text, detected_language, duration, segments_list, used_batching
 
     def _resolve_batch_enabled(self, request_data: TranscribeRequest) -> bool:
+        """Determine whether batched inference should be used.
+
+        Priority: batch_mode explicit > use_batch flag > server default.
+        """
         if request_data.batch_mode == "on":
             return True
         if request_data.batch_mode == "off":
@@ -230,53 +330,21 @@ class WhisperService:
         return settings.batch_enabled
 
     def _resolve_vad_enabled(self, request_data: TranscribeRequest) -> bool:
+        """Determine whether Silero VAD should be applied.
+
+        Priority: vad_mode explicit > request-level vad_filter toggle.
+        """
         if request_data.vad_mode == "on":
             return True
         if request_data.vad_mode == "off":
             return False
         return request_data.vad.vad_filter
 
-    def merge_chunk_outputs(
-        self,
-        *,
-        job_dir: Path,
-        chunk_results: list[TranscriptArtifacts],
-        formats: list[str],
-        task: str,
-    ) -> TranscriptArtifacts:
-        if not chunk_results:
-            raise ValueError("No chunk results to merge.")
 
-        all_segments: list[SegmentOut] = []
-        full_text_parts: list[str] = []
-        total_duration = 0.0
-        for chunk in chunk_results:
-            all_segments.extend(chunk.segments)
-            if chunk.text:
-                full_text_parts.append(chunk.text)
-            total_duration = max(total_duration, chunk.duration)
-
-        merged_text = "\n".join(full_text_parts).strip()
-        merged = write_outputs(
-            model_name=chunk_results[0].model_name,
-            device=chunk_results[0].device,
-            compute_type=chunk_results[0].compute_type,
-            job_dir=job_dir,
-            text=merged_text,
-            language=chunk_results[0].language,
-            duration=total_duration,
-            segments=all_segments,
-            formats=formats,
-            task=task,
-            vad={},
-            chunk_index=0,
-            used_batching=True,
-            chunk_count=len(chunk_results),
-        )
-        return merged
-
+# ── Output file writers (module-level helpers) ──────────────────────────
 
 def format_timestamp(seconds: float) -> str:
+    """Convert seconds to SRT timestamp format ``HH:MM:SS,mmm``."""
     ms_total = int(round(seconds * 1000))
     hours, remainder = divmod(ms_total, 3_600_000)
     minutes, remainder = divmod(remainder, 60_000)
@@ -285,6 +353,7 @@ def format_timestamp(seconds: float) -> str:
 
 
 def build_srt(segments: list[SegmentOut]) -> str:
+    """Build an SRT subtitle string from a list of segments."""
     chunks: list[str] = []
     for idx, segment in enumerate(segments, start=1):
         chunks.append(str(idx))
@@ -311,6 +380,12 @@ def write_outputs(
     used_batching: bool,
     chunk_count: int,
 ) -> TranscriptArtifacts:
+    """Write requested output files (txt/srt/json) into *job_dir* and
+    return a ``TranscriptArtifacts`` summary.
+
+    When *chunk_index* > 0 the filenames get a ``_chunk_NNNN`` suffix so
+    per-chunk files don't overwrite each other.
+    """
     output_files: dict[str, Path] = {}
     suffix = f"_chunk_{chunk_index:04d}" if chunk_index > 0 else ""
 
@@ -354,4 +429,3 @@ def write_outputs(
         used_batching=used_batching,
         chunk_count=chunk_count,
     )
-
