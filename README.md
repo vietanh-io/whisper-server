@@ -33,14 +33,14 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 copy .env.example .env
-python -m uvicorn src.main:app --host 127.0.0.1 --port 8000 --reload
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 ## Project structure
 
 ```
 whisper-server/
-  src/
+  app/
     main.py                  # FastAPI app factory, lifespan, router aggregation
     config.py                # Pydantic settings loaded from .env
     transcribe/
@@ -91,7 +91,102 @@ Audio --> [Whisper: transcribe] --> Source text --> [argostranslate] --> Transla
 
 ## API examples
 
-### Single file upload
+### Health check
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "service": "whisper-server",
+  "env": "dev",
+  "ffmpeg": "available"
+}
+```
+
+### List available models
+
+```bash
+curl http://127.0.0.1:8000/models
+```
+
+Response:
+
+```json
+{
+  "available_model_names": ["base", "base.en", "distil-large-v2", "distil-large-v3", "large-v1", "large-v2", "large-v3", "medium", "medium.en", "small", "small.en", "tiny", "tiny.en"],
+  "downloaded_models": ["models--Systran--faster-whisper-small"]
+}
+```
+
+### Download a model
+
+Pre-download a model so the first transcription request is fast.
+
+```bash
+curl -X POST "http://127.0.0.1:8000/models/download" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "small"}'
+```
+
+You can also specify device and compute type:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/models/download" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "large-v3", "device": "cuda", "compute_type": "float16"}'
+```
+
+Response:
+
+```json
+{
+  "model": "small",
+  "device": "cpu",
+  "compute_type": "int8",
+  "download_root": "models"
+}
+```
+
+### Transcribe a single file (minimal)
+
+The simplest call -- just upload a file, server uses all defaults.
+
+```bash
+curl -X POST "http://127.0.0.1:8000/transcribe" \
+  -F "file=@recording.mp3"
+```
+
+Response:
+
+```json
+{
+  "job_id": "a1b2c3d4-...",
+  "model": "small",
+  "device": "cpu",
+  "compute_type": "int8",
+  "language": "en",
+  "duration": 125.4,
+  "text": "Hello, welcome to the meeting...",
+  "translated_text": null,
+  "segments": [
+    {"start": 0.0, "end": 3.52, "text": "Hello, welcome to the meeting."},
+    {"start": 3.52, "end": 7.84, "text": "Today we will discuss the roadmap."}
+  ],
+  "output_files": {
+    "txt": "/outputs/a1b2c3d4-.../transcript.txt",
+    "srt": "/outputs/a1b2c3d4-.../transcript.srt"
+  },
+  "used_batching": false,
+  "chunk_count": 1
+}
+```
+
+### Transcribe with full options
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/transcribe" \
@@ -109,6 +204,35 @@ curl -X POST "http://127.0.0.1:8000/transcribe" \
   -F "initial_prompt=Technical meeting about AI"
 ```
 
+### Transcribe with auto-detect language
+
+Omit `source_language` and Whisper will detect the spoken language automatically.
+
+```bash
+curl -X POST "http://127.0.0.1:8000/transcribe" \
+  -F "file=@unknown_language.wav" \
+  -F "output_formats=txt,srt,json"
+```
+
+### Transcribe a remote URL
+
+Pass a `media_url` instead of a file. Supports HTTP/HTTPS links, S3 presigned URLs, and YouTube.
+
+```bash
+curl -X POST "http://127.0.0.1:8000/transcribe" \
+  -F "media_url=https://example.com/podcast.mp3" \
+  -F "model=small" \
+  -F "output_formats=txt,srt"
+```
+
+YouTube URLs are resolved automatically via yt-dlp:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/transcribe" \
+  -F "media_url=https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
+  -F "source_language=en"
+```
+
 ### Translate Japanese audio to English
 
 ```bash
@@ -119,7 +243,25 @@ curl -X POST "http://127.0.0.1:8000/transcribe" \
   -F "target_language=en"
 ```
 
-### Translate to Vietnamese (any target language)
+Response includes both original and translated text:
+
+```json
+{
+  "job_id": "...",
+  "language": "ja",
+  "text": "こんにちは、本日の会議へようこそ...",
+  "translated_text": "Hello, welcome to today's meeting...",
+  "output_files": {
+    "txt": "/outputs/.../transcript.txt",
+    "txt_original": "/outputs/.../transcript_original.txt",
+    "srt": "/outputs/.../transcript.srt"
+  }
+}
+```
+
+### Translate to any target language
+
+Not limited to English -- translate to any language argostranslate supports.
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/transcribe" \
@@ -129,39 +271,91 @@ curl -X POST "http://127.0.0.1:8000/transcribe" \
   -F "target_language=vi"
 ```
 
-### Multiple file uploads
+### Transcribe multiple files at once
+
+Each file is processed sequentially with the same settings.
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/transcribe/uploads" \
-  -F "files=@a.mp4" \
-  -F "files=@b.mp4" \
+  -F "files=@meeting_part1.mp4" \
+  -F "files=@meeting_part2.mp4" \
+  -F "files=@meeting_part3.mp4" \
   -F "source_language=ja" \
   -F "task=translate" \
   -F "target_language=en" \
+  -F "model=large-v3" \
   -F "batch_size=8"
 ```
 
-### Remote links (HTTP/S3/YouTube)
+Response:
+
+```json
+{
+  "items": [
+    {"job_id": "...", "text": "...", "duration": 600.0, "...": "..."},
+    {"job_id": "...", "text": "...", "duration": 450.0, "...": "..."},
+    {"job_id": "...", "text": "...", "duration": 300.0, "...": "..."}
+  ]
+}
+```
+
+### Transcribe multiple remote links
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/transcribe/links" \
   -H "Content-Type: application/json" \
   -d '{
     "links": [
-      "https://example.com/media.mp4",
+      "https://example.com/episode1.mp3",
+      "https://example.com/episode2.mp3",
       "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     ],
-    "source_language": "ko",
-    "task": "translate",
-    "target_language": "en",
+    "source_language": "en",
+    "task": "transcribe",
     "model": "small",
-    "device": "cpu",
-    "compute_type": "int8",
-    "batch_size": 8
+    "output_formats": ["txt", "srt", "json"]
   }'
 ```
 
+### Download output files
+
+After transcription, download the generated files using the paths from the response.
+
+```bash
+# Download the transcript text file
+curl -O http://127.0.0.1:8000/outputs/{job_id}/transcript.txt
+
+# Download the SRT subtitle file
+curl -O http://127.0.0.1:8000/outputs/{job_id}/transcript.srt
+
+# Download the JSON file (includes segments, metadata)
+curl -O http://127.0.0.1:8000/outputs/{job_id}/transcript.json
+```
+
+### List available translation pairs
+
+```bash
+curl http://127.0.0.1:8000/languages
+```
+
+Response:
+
+```json
+{
+  "available": [
+    {"from_code": "en", "from_name": "English", "to_code": "ja", "to_name": "Japanese"},
+    {"from_code": "ja", "from_name": "Japanese", "to_code": "en", "to_name": "English"},
+    {"from_code": "en", "from_name": "English", "to_code": "vi", "to_name": "Vietnamese"}
+  ],
+  "installed": [
+    {"from_code": "ja", "from_name": "Japanese", "to_code": "en", "to_name": "English"}
+  ]
+}
+```
+
 ### Pre-download a language pair
+
+Download a translation pair ahead of time so the first translate request is fast.
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/languages/download" \
@@ -169,10 +363,10 @@ curl -X POST "http://127.0.0.1:8000/languages/download" \
   -d '{"from_code": "ja", "to_code": "en"}'
 ```
 
-### List available translation pairs
+Response:
 
-```bash
-curl http://127.0.0.1:8000/languages
+```json
+{"from_code": "ja", "to_code": "en", "status": "installed"}
 ```
 
 ## CLI client (`scripts/client.py`)
@@ -320,6 +514,64 @@ For GPU support, use the NVIDIA runtime:
 ```bash
 docker run --rm --gpus all -p 8000:8000 --env-file .env whisper-server:latest
 ```
+
+## Model selection guide
+
+Models are downloaded automatically from [Hugging Face](https://huggingface.co/Systran) on first use and cached locally in the `models/` directory. After the initial download, no internet connection is required.
+
+### Available models
+
+| Model | Parameters | Size on disk | Best for |
+|-------|-----------|-------------|----------|
+| `tiny` / `tiny.en` | 39M | ~75 MB | Quick testing, low-resource devices |
+| `base` / `base.en` | 74M | ~140 MB | Light workloads, acceptable quality |
+| `small` / `small.en` | 244M | ~460 MB | **Recommended default** -- good balance of speed and accuracy |
+| `medium` / `medium.en` | 769M | ~1.5 GB | Higher accuracy, slower |
+| `large-v1` | 1550M | ~3 GB | Best accuracy (first generation) |
+| `large-v2` | 1550M | ~3 GB | Best accuracy (improved) |
+| `large-v3` | 1550M | ~3 GB | Best accuracy (latest) |
+| `distil-large-v2` | ~756M | ~1.5 GB | Near large-v2 quality at 2x speed |
+| `distil-large-v3` | ~756M | ~1.5 GB | Near large-v3 quality at 2x speed |
+
+`.en` variants are English-only and slightly more accurate for English than their multilingual counterparts.
+
+### Hardware requirements
+
+| Model | Min RAM | GPU VRAM | CPU speed (10 min audio) | GPU speed (10 min audio) |
+|-------|---------|----------|--------------------------|--------------------------|
+| `tiny` | ~1 GB | ~1 GB | ~1 min | ~5 sec |
+| `small` | ~2 GB | ~2 GB | ~4 min | ~15 sec |
+| `medium` | ~5 GB | ~4 GB | ~10 min | ~30 sec |
+| `large-v3` | ~10 GB | ~6 GB | ~20 min | ~45 sec |
+| `distil-large-v3` | ~6 GB | ~4 GB | ~10 min | ~20 sec |
+
+Speed estimates are approximate and vary by hardware. GPU times assume an NVIDIA T4 or better.
+
+### Choosing a model
+
+- **Development / testing**: use `tiny` or `base` for fast iteration
+- **Production (CPU, cost-sensitive)**: use `small` with `compute_type=int8` -- the server default
+- **Production (GPU available)**: use `large-v3` or `distil-large-v3` with `compute_type=float16`
+- **English only**: use `.en` variants (e.g. `small.en`) for slightly better accuracy
+- **Best speed/quality tradeoff**: use `distil-large-v3` -- close to `large-v3` quality at roughly half the compute cost
+
+### Pre-downloading models
+
+To avoid download delays on the first request, pre-download models at deploy time:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/models/download" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "small"}'
+```
+
+Or in Docker, mount a volume so models persist across container restarts:
+
+```bash
+docker run --rm -p 8000:8000 --env-file .env -v ./models:/app/models whisper-server:latest
+```
+
+Set `FASTER_WHISPER_LOCAL_FILES_ONLY=true` in `.env` to prevent any automatic downloads (useful for air-gapped deployments).
 
 ## Configuration
 

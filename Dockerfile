@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# ffmpeg + ffprobe are required for all audio transcoding and probing.
+# # ffmpeg + ffprobe are required for all audio transcoding and probing.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
@@ -15,11 +15,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY src ./src
+COPY app ./app
 COPY scripts ./scripts
-COPY .env.example ./.env.example
+COPY .env ./.env
 
 EXPOSE 8000
 
 # Bind to 0.0.0.0 so the container port is reachable from the host.
-CMD ["python", "-m", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
