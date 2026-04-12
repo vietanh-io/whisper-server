@@ -1,5 +1,5 @@
 """
-Pydantic models for every request and response in the transcription API.
+Pydantic models for the transcription domain.
 
 Key design decisions
 --------------------
@@ -60,6 +60,7 @@ class TranscribeRequest(BaseModel):
 
     media_url: str | None = None
     source_language: SupportedSourceLanguage | None = None
+    target_language: str = "en"
     task: WhisperTask = "transcribe"
     output_formats: list[OutputFormat] = Field(default_factory=lambda: ["txt", "srt"])
     vad: VADConfig = Field(default_factory=VADConfig)
@@ -114,6 +115,7 @@ class TranscribeFormInput(BaseModel):
 
     media_url: str | None = None
     source_language: SupportedSourceLanguage | None = None
+    target_language: str = "en"
     task: WhisperTask = "transcribe"
     output_formats: str = "txt,srt"
     vad_filter: bool = True
@@ -187,6 +189,7 @@ class TranscribeFormInput(BaseModel):
         return TranscribeRequest(
             media_url=self.media_url,
             source_language=self.source_language,
+            target_language=self.target_language,
             task=self.task,
             output_formats=self.parsed_formats(),
             vad=VADConfig(
@@ -246,8 +249,9 @@ class TranscribeResponse(BaseModel):
     language: str | None
     duration: float
     text: str
+    translated_text: str | None = None
     segments: list[SegmentOut]
-    output_files: dict[str, str]   # format -> download URL path
+    output_files: dict[str, str]
     used_batching: bool = False
     chunk_count: int = 1
 
@@ -270,6 +274,7 @@ class RemoteLinksRequest(BaseModel):
 
     links: list[str] = Field(default_factory=list, min_length=1)
     source_language: SupportedSourceLanguage | None = None
+    target_language: str = "en"
     task: WhisperTask = "transcribe"
     output_formats: list[OutputFormat] = Field(default_factory=lambda: ["txt", "srt"])
     model: str | None = None

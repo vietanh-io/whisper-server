@@ -1,6 +1,6 @@
 # whisper-server (Developer-first Faster-Whisper API)
 
-FastAPI service wrapping [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for production and development transcription workflows.
+FastAPI service wrapping [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for production and development transcription workflows, with built-in translation via [argostranslate](https://github.com/argosopentech/argos-translate).
 
 ## Features
 
@@ -9,7 +9,7 @@ FastAPI service wrapping [faster-whisper](https://github.com/SYSTRAN/faster-whis
 - Remote links (`application/json`) with arrays of HTTP/S3/YouTube URLs
 - Transcribe by streaming input through `ffmpeg` into normalized 16 kHz mono WAV
 - Batch long media by chunking and merging transcripts automatically
-- Both tasks: `transcribe` (keep source language) and `translate` (to English)
+- Both tasks: `transcribe` (keep source language) and `translate` (to any target language via argostranslate)
 - Per-request model/runtime controls: `model`, `device`, `compute_type`, `beam_size`, VAD, word timestamps
 - Per-request batching mode: `batch_mode=auto|on|off`
 - Per-request Silero VAD mode: `vad_mode=auto|on|off`
@@ -17,6 +17,8 @@ FastAPI service wrapping [faster-whisper](https://github.com/SYSTRAN/faster-whis
 - Quality thresholds: `compression_ratio_threshold`, `log_prob_threshold`, `no_speech_threshold`
 - Context/prompting: `condition_on_previous_text`, `initial_prompt`, `hotwords`, `prefix`
 - Hallucination control: `hallucination_silence_threshold`, `suppress_blank`
+- Translation to any language (not just English) with `target_language` parameter
+- Language pair management: list, download, and cache argostranslate packages
 - CLI client (`scripts/client.py`) with full parameter support
 
 ## Requirements
@@ -31,22 +33,27 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 copy .env.example .env
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+python -m uvicorn src.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 ## Project structure
 
 ```
 whisper-server/
-  app/
-    main.py                  # FastAPI app factory, lifespan, global singletons
-    api/router.py            # Top-level router that mounts all sub-routers
-    core/config.py           # Pydantic settings loaded from .env
-    transcription/
+  src/
+    main.py                  # FastAPI app factory, lifespan, router aggregation
+    config.py                # Pydantic settings loaded from .env
+    transcribe/
+      router.py              # HTTP endpoints (health, models, transcribe, outputs)
       schemas.py             # Request/response Pydantic models
       service.py             # Whisper inference logic and output file writing
-      media.py               # ffmpeg transcoding, chunking, workspace management
-      router.py              # HTTP endpoints (transcribe, models, outputs)
+      dependencies.py        # FastAPI dependency injection helpers
+    media/
+      service.py             # ffmpeg transcoding, chunking, workspace management
+    translation/
+      router.py              # HTTP endpoints (languages list & download)
+      schemas.py             # Language pair Pydantic models
+      service.py             # argostranslate wrapper (TranslationService)
       dependencies.py        # FastAPI dependency injection helpers
   scripts/
     client.py                # CLI client for the server
@@ -55,13 +62,28 @@ whisper-server/
   requirements.txt           # Python dependencies
 ```
 
+## Translation architecture
+
+When `task=translate`, the server uses a two-step pipeline:
+
+1. **Whisper transcribes** the audio in its source language (always `task=transcribe` internally)
+2. **argostranslate translates** the resulting text to `target_language`
+
+This replaces Whisper's built-in translate mode and supports translation to **any language** that argostranslate supports (not just English). Language pair packages are downloaded automatically on first use and cached locally.
+
+```
+Audio --> [Whisper: transcribe] --> Source text --> [argostranslate] --> Translated text
+```
+
 ## API endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Server health check (includes ffmpeg status) |
-| `GET` | `/models` | List available and downloaded model names |
-| `POST` | `/models/download` | Download a model by name |
+| `GET` | `/models` | List available and downloaded Whisper model names |
+| `POST` | `/models/download` | Download a Whisper model by name |
+| `GET` | `/languages` | List available and installed translation language pairs |
+| `POST` | `/languages/download` | Pre-download a translation language pair |
 | `POST` | `/transcribe` | Transcribe a single file upload or remote URL |
 | `POST` | `/transcribe/uploads` | Transcribe multiple file uploads |
 | `POST` | `/transcribe/links` | Transcribe a JSON array of remote URLs |
@@ -87,6 +109,26 @@ curl -X POST "http://127.0.0.1:8000/transcribe" \
   -F "initial_prompt=Technical meeting about AI"
 ```
 
+### Translate Japanese audio to English
+
+```bash
+curl -X POST "http://127.0.0.1:8000/transcribe" \
+  -F "file=@interview.wav" \
+  -F "task=translate" \
+  -F "source_language=ja" \
+  -F "target_language=en"
+```
+
+### Translate to Vietnamese (any target language)
+
+```bash
+curl -X POST "http://127.0.0.1:8000/transcribe" \
+  -F "file=@lecture.mp3" \
+  -F "task=translate" \
+  -F "source_language=en" \
+  -F "target_language=vi"
+```
+
 ### Multiple file uploads
 
 ```bash
@@ -95,6 +137,7 @@ curl -X POST "http://127.0.0.1:8000/transcribe/uploads" \
   -F "files=@b.mp4" \
   -F "source_language=ja" \
   -F "task=translate" \
+  -F "target_language=en" \
   -F "batch_size=8"
 ```
 
@@ -109,19 +152,32 @@ curl -X POST "http://127.0.0.1:8000/transcribe/links" \
       "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     ],
     "source_language": "ko",
-    "task": "transcribe",
+    "task": "translate",
+    "target_language": "en",
     "model": "small",
     "device": "cpu",
     "compute_type": "int8",
-    "batch_size": 8,
-    "condition_on_previous_text": false,
-    "hotwords": "AI transformer attention"
+    "batch_size": 8
   }'
+```
+
+### Pre-download a language pair
+
+```bash
+curl -X POST "http://127.0.0.1:8000/languages/download" \
+  -H "Content-Type: application/json" \
+  -d '{"from_code": "ja", "to_code": "en"}'
+```
+
+### List available translation pairs
+
+```bash
+curl http://127.0.0.1:8000/languages
 ```
 
 ## CLI client (`scripts/client.py`)
 
-A command-line client that talks to the running server. Supports all transcription parameters.
+A command-line client that talks to the running server. Supports all transcription and translation parameters.
 
 ### Basic usage
 
@@ -134,6 +190,9 @@ python scripts/client.py --media-url "https://example.com/audio.mp3"
 
 # Translate Japanese audio to English
 python scripts/client.py --file interview.wav --task translate --source-language ja
+
+# Translate to Vietnamese
+python scripts/client.py --file lecture.mp3 --task translate --source-language en --target-language vi
 ```
 
 ### Model and device options
@@ -197,8 +256,9 @@ Connection:
   --timeout SECONDS        Request timeout (default: 3600)
 
 Task:
-  --task {transcribe,translate}   Transcribe or translate to English
+  --task {transcribe,translate}   Transcribe or translate to target language
   --source-language LANG          ISO language code (e.g. en, vi, ja)
+  --target-language LANG          Translation target language (default: en)
   --output-formats FORMATS        Comma-separated: txt,srt,json
 
 Model:
@@ -267,9 +327,10 @@ All settings can be overridden via environment variables or a `.env` file. See [
 
 ### Task behavior
 
-- `task=transcribe`: keep original source language.
-- `task=translate`: translate to English (Whisper only supports translation to English).
-- If `task=translate` and source is English, the API returns `400` (configurable via `REJECT_ENGLISH_SOURCE_ON_TRANSLATE`).
+- `task=transcribe`: keep original source language (no translation).
+- `task=translate`: Whisper transcribes in source language, then argostranslate translates to `target_language`.
+- `target_language` defaults to `en` for backward compatibility.
+- Translation supports any language pair that argostranslate has packages for. Language packages are auto-downloaded on first use.
 
 ### Batching behavior
 
@@ -283,12 +344,21 @@ All settings can be overridden via environment variables or a `.env` file. See [
 - `vad_mode=on`: force Silero VAD on (removes silence before transcription).
 - `vad_mode=off`: force Silero VAD off.
 
+### Translation output files
+
+When `task=translate`, the output files contain:
+- `transcript.txt` -- the translated text (primary output)
+- `transcript_original.txt` -- the source-language transcription
+- `transcript.srt` -- SRT subtitles (source-language segments with timestamps)
+- `transcript.json` -- includes both `text` (translated) and `original_text` (source)
+
 ## Advanced transcription parameters
 
 All parameters below can be sent per-request (form field or JSON body) and have server-level defaults via env vars.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `target_language` | string | `en` | ISO 639 target language for translation (only used when task=translate) |
 | `temperature` | comma-separated floats | `0.0,0.2,0.4,0.6,0.8,1.0` | Temperature fallback sequence. Single `0.0` = greedy decoding. |
 | `best_of` | int | `5` | Candidates when sampling with temperature > 0 |
 | `patience` | float | `1.0` | Beam search patience factor |

@@ -10,6 +10,10 @@ Responsibilities
   **batched** (``BatchedInferencePipeline.transcribe``) mode, forwarding
   all decoding, quality-threshold, prompting, and VAD parameters from
   the request.
+* When ``task=translate``, Whisper **always transcribes** in the source
+  language, then argostranslate translates the text to the requested
+  ``target_language``.  This replaces Whisper's built-in translate mode
+  and supports translation to any language, not just English.
 * Write transcript output files (txt, srt, json) into the job directory.
 * Merge chunked results when long-media batching is used.
 """
@@ -22,8 +26,9 @@ from typing import Any
 from faster_whisper import BatchedInferencePipeline, WhisperModel
 from faster_whisper.utils import available_models
 
-from app.core.config import settings
-from app.transcription.schemas import SegmentOut, TranscribeRequest
+from app.config import settings
+from app.transcribe.schemas import SegmentOut, TranscribeRequest
+from app.translation.service import TranslationService
 
 
 @dataclass
@@ -34,6 +39,7 @@ class TranscriptArtifacts:
     device: str
     compute_type: str
     text: str
+    translated_text: str | None
     language: str | None
     duration: float
     segments: list[SegmentOut]
@@ -43,11 +49,12 @@ class TranscriptArtifacts:
 
 
 class WhisperService:
-    """Manages faster-whisper model instances and runs inference."""
+    """Manages faster-whisper model instances, runs inference, and
+    delegates post-transcription translation to TranslationService."""
 
-    def __init__(self) -> None:
-        # Cache: (model_name, device, compute_type) -> loaded WhisperModel
+    def __init__(self, translation_service: TranslationService) -> None:
         self._models: dict[tuple[str, str, str], WhisperModel] = {}
+        self._translation = translation_service
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -62,6 +69,10 @@ class WhisperService:
     ) -> TranscriptArtifacts:
         """Transcribe a single WAV file and write outputs to *job_dir*.
 
+        When ``task=translate``, Whisper still runs in transcribe mode
+        (producing source-language text), and argostranslate translates
+        the output to ``target_language`` afterward.
+
         When processing chunked audio, *chunk_index* > 0 indicates which
         chunk this is, and *chunk_offset_seconds* shifts all segment
         timestamps so they reflect their position in the original media.
@@ -69,14 +80,6 @@ class WhisperService:
         source_language = request_data.source_language or settings.default_source_language
         if isinstance(source_language, str):
             source_language = source_language.strip().lower() or None
-
-        # Guard: reject English->English translation early when configured
-        if (
-            request_data.task == "translate"
-            and source_language == "en"
-            and settings.reject_english_source_on_translate
-        ):
-            raise ValueError("English source is not supported. Only non-English to English is supported.")
 
         model_name = request_data.model or settings.faster_whisper_model
         device = request_data.device or settings.faster_whisper_device
@@ -90,15 +93,6 @@ class WhisperService:
             source_language=source_language,
         )
 
-        # Post-detection guard: if whisper auto-detected English, reject
-        if (
-            request_data.task == "translate"
-            and detected_language == "en"
-            and settings.reject_english_source_on_translate
-        ):
-            raise ValueError("Detected source language is English. Only non-English to English is supported.")
-
-        # Shift timestamps when this is a chunk within a larger media file
         if chunk_offset_seconds > 0:
             shifted: list[SegmentOut] = []
             for seg in segments_list:
@@ -111,12 +105,20 @@ class WhisperService:
                 )
             segments_list = shifted
 
+        translated_text: str | None = None
+        if request_data.task == "translate" and text:
+            resolved_source = detected_language or source_language
+            target = request_data.target_language or settings.default_target_language
+            if resolved_source and resolved_source != target:
+                translated_text = self._translation.translate(text, resolved_source, target)
+
         return write_outputs(
             model_name=model_name,
             device=device,
             compute_type=compute_type,
             job_dir=job_dir,
             text=text,
+            translated_text=translated_text,
             language=detected_language,
             duration=duration,
             segments=segments_list,
@@ -167,11 +169,14 @@ class WhisperService:
         chunk_results: list[TranscriptArtifacts],
         formats: list[str],
         task: str,
+        target_language: str = "en",
     ) -> TranscriptArtifacts:
         """Merge multiple chunk transcription results into a single output.
 
         Called after long-media chunking to produce a unified transcript
-        file set that covers the entire original media.
+        file set that covers the entire original media.  When
+        ``task=translate``, the merged text is translated as a whole for
+        better coherence than per-chunk translation.
         """
         if not chunk_results:
             raise ValueError("No chunk results to merge.")
@@ -186,12 +191,20 @@ class WhisperService:
             total_duration = max(total_duration, chunk.duration)
 
         merged_text = "\n".join(full_text_parts).strip()
+
+        translated_text: str | None = None
+        if task == "translate" and merged_text:
+            source_lang = chunk_results[0].language
+            if source_lang and source_lang != target_language:
+                translated_text = self._translation.translate(merged_text, source_lang, target_language)
+
         merged = write_outputs(
             model_name=chunk_results[0].model_name,
             device=chunk_results[0].device,
             compute_type=chunk_results[0].compute_type,
             job_dir=job_dir,
             text=merged_text,
+            translated_text=translated_text,
             language=chunk_results[0].language,
             duration=total_duration,
             segments=all_segments,
@@ -245,16 +258,13 @@ class WhisperService:
             "speech_pad_ms": request_data.vad.speech_pad_ms,
         }
 
-        # faster-whisper accepts float (greedy) or list[float] (fallback sequence)
         temperature: float | list[float] = request_data.temperature
         if len(request_data.temperature) == 1:
             temperature = request_data.temperature[0]
 
-        # Parameters accepted by both WhisperModel.transcribe() and
-        # BatchedInferencePipeline.transcribe()
         common_params: dict[str, Any] = {
             "language": source_language,
-            "task": request_data.task,
+            "task": "transcribe",
             "beam_size": request_data.beam_size,
             "best_of": request_data.best_of,
             "patience": request_data.patience,
@@ -285,9 +295,6 @@ class WhisperService:
             )
             used_batching = True
         else:
-            # These params are only supported by sequential WhisperModel.transcribe(),
-            # not by BatchedInferencePipeline:
-            #   prefix, max_initial_timestamp, hallucination_silence_threshold, max_new_tokens
             segments_iter, info = model.transcribe(
                 str(input_path),
                 prefix=request_data.prefix,
@@ -298,7 +305,6 @@ class WhisperService:
             )
             used_batching = False
 
-        # Consume the segment generator and collect results
         segments_list: list[SegmentOut] = []
         text_parts: list[str] = []
         duration = 0.0
@@ -367,6 +373,7 @@ def write_outputs(
     *,
     job_dir: Path,
     text: str,
+    translated_text: str | None,
     language: str | None,
     duration: float,
     segments: list[SegmentOut],
@@ -383,16 +390,22 @@ def write_outputs(
     """Write requested output files (txt/srt/json) into *job_dir* and
     return a ``TranscriptArtifacts`` summary.
 
-    When *chunk_index* > 0 the filenames get a ``_chunk_NNNN`` suffix so
-    per-chunk files don't overwrite each other.
+    When *translated_text* is provided (task=translate), output files
+    contain the translated text as the primary content and the original
+    source-language text is preserved in a ``_original`` companion file.
     """
     output_files: dict[str, Path] = {}
     suffix = f"_chunk_{chunk_index:04d}" if chunk_index > 0 else ""
+    primary_text = translated_text if translated_text else text
 
     if "txt" in formats:
         txt_path = job_dir / f"transcript{suffix}.txt"
-        txt_path.write_text(text, encoding="utf-8")
+        txt_path.write_text(primary_text, encoding="utf-8")
         output_files["txt"] = txt_path
+        if translated_text:
+            original_path = job_dir / f"transcript{suffix}_original.txt"
+            original_path.write_text(text, encoding="utf-8")
+            output_files["txt_original"] = original_path
 
     if "srt" in formats:
         srt_path = job_dir / f"transcript{suffix}.srt"
@@ -401,8 +414,8 @@ def write_outputs(
 
     if "json" in formats:
         json_path = job_dir / f"transcript{suffix}.json"
-        payload = {
-            "text": text,
+        payload: dict[str, Any] = {
+            "text": primary_text,
             "language": language,
             "duration": duration,
             "model": model_name,
@@ -414,6 +427,8 @@ def write_outputs(
             "used_batching": used_batching,
             "chunk_count": chunk_count,
         }
+        if translated_text:
+            payload["original_text"] = text
         json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         output_files["json"] = json_path
 
@@ -422,6 +437,7 @@ def write_outputs(
         device=device,
         compute_type=compute_type,
         text=text,
+        translated_text=translated_text,
         language=language,
         duration=duration,
         segments=segments,

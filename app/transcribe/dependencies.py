@@ -1,9 +1,9 @@
 """
-FastAPI dependency-injection helpers for the transcription module.
+FastAPI dependency-injection helpers for the transcribe module.
 
-Services (WhisperService, MediaService) are created once at startup and
-stored on ``app.state``.  These functions retrieve them so endpoint
-handlers can declare them via ``Depends()``.
+Services are created once at startup and stored on ``app.state``.
+These functions retrieve them so endpoint handlers can declare them
+via ``Depends()``.
 
 ``FfmpegReady`` is a reusable dependency that gates any endpoint
 requiring ffmpeg -- it returns 503 if ffmpeg was not found at startup.
@@ -13,8 +13,8 @@ from typing import cast
 
 from fastapi import Depends, HTTPException, Request
 
-from app.transcription.media import MediaService
-from app.transcription.service import WhisperService
+from app.media.service import MediaService
+from app.transcribe.service import WhisperService
 
 
 def get_media_service(request: Request) -> MediaService:
@@ -38,5 +38,4 @@ def require_ffmpeg(request: Request) -> bool:
     return ffmpeg_ok
 
 
-# Shorthand so endpoints can write: _ffmpeg_ready: Annotated[bool, FfmpegReady]
 FfmpegReady = Depends(require_ffmpeg)

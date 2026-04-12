@@ -21,6 +21,8 @@ Data flow
 3. Both paths normalise input to a 16 kHz WAV via ``MediaService``, then
    delegate to ``_transcribe_prepared_wav`` which decides whether to
    chunk (long-media batching) or transcribe directly.
+4. When ``task=translate``, Whisper always transcribes in the source
+   language, then argostranslate translates the text to ``target_language``.
 """
 
 import logging
@@ -30,14 +32,14 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from app.core.config import settings
-from app.transcription.dependencies import (
+from app.config import settings
+from app.media.service import MediaService
+from app.transcribe.dependencies import (
     FfmpegReady,
     get_media_service,
     get_whisper_service,
 )
-from app.transcription.media import MediaService
-from app.transcription.schemas import (
+from app.transcribe.schemas import (
     AvailableModelsResponse,
     BatchTranscribeResponse,
     DownloadModelRequest,
@@ -47,7 +49,7 @@ from app.transcription.schemas import (
     TranscribeRequest,
     TranscribeResponse,
 )
-from app.transcription.service import WhisperService
+from app.transcribe.service import WhisperService
 
 router = APIRouter(tags=["transcription"])
 logger = logging.getLogger(__name__)
@@ -98,6 +100,7 @@ def download_model(
 def _build_request_from_form(
     *,
     source_language: str | None,
+    target_language: str,
     task: str,
     output_formats: str,
     vad_filter: bool,
@@ -133,14 +136,11 @@ def _build_request_from_form(
     max_initial_timestamp: float,
     max_new_tokens: int | None,
 ) -> TranscribeRequest:
-    """Construct a validated TranscribeRequest from raw form field values.
-
-    Uses TranscribeFormInput as an intermediate to handle string parsing
-    (comma-separated formats/temperatures) and Pydantic validation.
-    """
+    """Construct a validated TranscribeRequest from raw form field values."""
     return TranscribeFormInput(
         media_url=None,
         source_language=source_language,
+        target_language=target_language,
         task=task,
         output_formats=output_formats,
         vad_filter=vad_filter,
@@ -202,18 +202,13 @@ def _should_batch(duration_seconds: float, request_data: TranscribeRequest) -> b
 
 def _transcribe_prepared_wav(
     *,
-    media_service: Annotated[MediaService, Depends(get_media_service)],
-    whisper_service: Annotated[WhisperService, Depends(get_whisper_service)],
+    media_service: MediaService,
+    whisper_service: WhisperService,
     request_data: TranscribeRequest,
     workspace_input_wav: Path,
     workspace_job_dir: Path,
 ) -> TranscribeResponse:
-    """Transcribe a normalised WAV file, optionally chunking for long media.
-
-    If the audio duration exceeds the batch threshold (and batching is
-    enabled), the file is split into fixed-length chunks which are each
-    transcribed separately, then merged into a single result.
-    """
+    """Transcribe a normalised WAV file, optionally chunking for long media."""
     duration_seconds = media_service.probe_duration_seconds(workspace_input_wav)
     if _should_batch(duration_seconds, request_data):
         chunk_dir = workspace_job_dir / "chunks"
@@ -241,6 +236,7 @@ def _transcribe_prepared_wav(
             chunk_results=chunk_results,
             formats=request_data.output_formats,
             task=request_data.task,
+            target_language=request_data.target_language,
         )
         response_files = media_service.build_output_links_by_job_dir(
             job_dir=workspace_job_dir,
@@ -254,13 +250,13 @@ def _transcribe_prepared_wav(
             language=merged.language,
             duration=merged.duration,
             text=merged.text,
+            translated_text=merged.translated_text,
             segments=merged.segments,
             output_files=response_files,
             used_batching=True,
             chunk_count=merged.chunk_count,
         )
 
-    # Short media: transcribe the whole file in one pass
     single = whisper_service.transcribe(
         input_path=workspace_input_wav,
         request_data=request_data,
@@ -278,6 +274,7 @@ def _transcribe_prepared_wav(
         language=single.language,
         duration=single.duration,
         text=single.text,
+        translated_text=single.translated_text,
         segments=single.segments,
         output_files=response_files,
         used_batching=single.used_batching,
@@ -294,10 +291,7 @@ def _transcribe_single_upload(
     media_service: MediaService,
     whisper_service: WhisperService,
 ) -> TranscribeResponse:
-    """Save an uploaded file, transcode to WAV, and transcribe it.
-
-    The temporary input directory is always cleaned up, even on error.
-    """
+    """Save an uploaded file, transcode to WAV, and transcribe it."""
     workspace = media_service.create_workspace(file.filename)
     uploaded_path = workspace.input_dir / (file.filename or "upload.bin")
     wav_path = workspace.input_dir / "normalized.wav"
@@ -325,11 +319,7 @@ def _transcribe_single_remote_link(
     media_service: MediaService,
     whisper_service: WhisperService,
 ) -> TranscribeResponse:
-    """Resolve a remote URL, transcode to WAV via ffmpeg, and transcribe.
-
-    YouTube URLs are first resolved to a direct stream via yt-dlp.
-    The temporary input directory is always cleaned up, even on error.
-    """
+    """Resolve a remote URL, transcode to WAV via ffmpeg, and transcribe."""
     workspace = media_service.create_workspace("remote_link.wav")
     wav_path = workspace.input_dir / "normalized.wav"
     try:
@@ -359,6 +349,7 @@ async def transcribe_single(
     file: UploadFile | None = File(default=None),
     media_url: str | None = Form(default=None),
     source_language: str | None = Form(default=settings.default_source_language),
+    target_language: str = Form(default=settings.default_target_language),
     task: str = Form(default=settings.default_task),
     output_formats: str = Form(default=settings.default_output_formats),
     model: str | None = Form(default=None),
@@ -400,6 +391,7 @@ async def transcribe_single(
 
     request_data = _build_request_from_form(
         source_language=source_language,
+        target_language=target_language,
         task=task,
         output_formats=output_formats,
         vad_filter=vad_filter,
@@ -464,6 +456,7 @@ async def transcribe_uploads(
     whisper_service: Annotated[WhisperService, Depends(get_whisper_service)],
     files: list[UploadFile] = File(default_factory=list),
     source_language: str | None = Form(default=settings.default_source_language),
+    target_language: str = Form(default=settings.default_target_language),
     task: str = Form(default=settings.default_task),
     output_formats: str = Form(default=settings.default_output_formats),
     model: str | None = Form(default=None),
@@ -504,6 +497,7 @@ async def transcribe_uploads(
         raise HTTPException(status_code=400, detail="Provide at least one file in multipart/form-data.")
     request_data = _build_request_from_form(
         source_language=source_language,
+        target_language=target_language,
         task=task,
         output_formats=output_formats,
         vad_filter=vad_filter,
@@ -562,6 +556,7 @@ async def transcribe_links(
     """Transcribe a list of remote media URLs (JSON body)."""
     request_data = TranscribeRequest(
         source_language=payload.source_language,
+        target_language=payload.target_language,
         task=payload.task,
         output_formats=payload.output_formats,
         model=payload.model,

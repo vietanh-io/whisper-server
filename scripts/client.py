@@ -9,6 +9,7 @@ Usage examples:
     python scripts/client.py --file recording.mp4
     python scripts/client.py --media-url "https://example.com/audio.mp3"
     python scripts/client.py --file audio.mp3 --task translate --source-language ja
+    python scripts/client.py --file audio.mp3 --task translate --source-language ja --target-language vi
     python scripts/client.py --file audio.mp3 --temperature 0.0 --no-condition-on-previous-text
 """
 
@@ -52,6 +53,8 @@ def _populate_common_fields(data: dict[str, str], args: argparse.Namespace) -> N
     """
     if args.source_language is not None:
         data["source_language"] = args.source_language
+    if args.target_language is not None:
+        data["target_language"] = args.target_language
     if args.task is not None:
         data["task"] = args.task
     if args.output_formats is not None:
@@ -160,8 +163,10 @@ def main() -> None:
     # ── Task & output ───────────────────────────────────────────────
     parser.add_argument("--source-language", default=None,
                         help="ISO language code (e.g. en, vi, ja). None = auto-detect")
+    parser.add_argument("--target-language", default=None,
+                        help="ISO target language code for translation (default: en)")
     parser.add_argument("--task", choices=["transcribe", "translate"],
-                        help="transcribe or translate (to English)")
+                        help="transcribe or translate to target language")
     parser.add_argument("--output-formats",
                         help="Comma-separated: txt, srt, json")
 
@@ -246,6 +251,8 @@ def main() -> None:
     print(f"duration: {payload.get('duration')}")
     print(f"used_batching: {payload.get('used_batching')}")
     print(f"chunk_count: {payload.get('chunk_count')}")
+    if payload.get("translated_text"):
+        print(f"translated_text: {payload['translated_text'][:200]}...")
     print("output_files:")
     for kind, path in payload.get("output_files", {}).items():
         print(f"  - {kind}: {args.base_url}{path}")
